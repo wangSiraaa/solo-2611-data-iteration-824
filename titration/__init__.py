@@ -19,6 +19,16 @@ from .exact import (
     format_fraction,
 )
 from .potency import PotencyService
+from .repeatability import (
+    AnovaStats,
+    QuoteParams,
+    QuotePlan,
+    enumerate_plans,
+    mean_variance,
+    nested_anova,
+    plan_retest,
+)
+from .repeatability_service import RepeatabilityService
 from .solver import solve_selection, brute_force_selection
 from .store import Store
 
@@ -27,6 +37,7 @@ __all__ = [
     "MethodParams",
     "compute_candidates",
     "PotencyService",
+    "RepeatabilityService",
     "Store",
     "ValidationError",
     "NotFoundError",
@@ -35,4 +46,11 @@ __all__ = [
     "format_fraction",
     "solve_selection",
     "brute_force_selection",
+    "AnovaStats",
+    "QuoteParams",
+    "QuotePlan",
+    "nested_anova",
+    "plan_retest",
+    "enumerate_plans",
+    "mean_variance",
 ]

@@ -1,5 +1,5 @@
 {
-  "passed": 15,
+  "passed": 19,
   "failed": 0,
   "checks": [
     {
@@ -76,7 +76,27 @@
       "name": "potency_uses_only_public_products",
       "passed": true,
       "detail": "potency computed with private candidates deleted"
+    },
+    {
+      "name": "blind_headline_anova_and_quotes",
+      "passed": true,
+      "detail": "headline (0,2)/(4,6): within 2 between 7; caps 5/8 -> (2,1)/8 and (1,2)/5"
+    },
+    {
+      "name": "blind_negative_between_clamped_with_raw_components",
+      "passed": true,
+      "detail": "MS_within 2 > MS_between 1: raw estimate -1/2, clamped component 0"
+    },
+    {
+      "name": "blind_infeasible_quote_reports_best_variance",
+      "passed": true,
+      "detail": "cap 1 unreachable within 2 days x 2; best achievable variance 4"
+    },
+    {
+      "name": "blind_end_to_end_repeatability_scenario",
+      "passed": true,
+      "detail": "blind demo: dedup, clamp, corrected reveal, immutable re-audit, gaps"
     }
   ],
-  "db": "var/validate.sqlite"
+  "db": "var/validation.sqlite"
 }

@@ -9,7 +9,10 @@ Subcommands
 ``sample-create`` / ``sample-show`` / ``sample-eval``
 ``batch-create`` / ``batch-eval`` / ``report-show``
 ``import-product``   consume an external same-format product
+``blind-transmit`` / ``blind-reveal-create`` / ``blind-reveal-show``
+``blind-assess`` / ``blind-report-show`` / ``blind-replay`` / ``blind-quote``
 ``demo``             build the synthetic validation scenario end-to-end
+``blind-demo``       blind repeatability and retest-quote scenario
 ``validate``         run the self-checks and write a JSON result
 """
 
@@ -29,6 +32,7 @@ from .exact import (
     fraction_to_json,
 )
 from .potency import PotencyService
+from .repeatability_service import RepeatabilityService
 from .store import Store
 
 
@@ -190,11 +194,92 @@ def _cmd_demo(args: argparse.Namespace, svc: Any) -> None:
     _dump(run_demo(args.db))
 
 
+def _cmd_blind_demo(args: argparse.Namespace, svc: Any) -> None:
+    from .blind_demo import run_blind_demo
+
+    _dump(run_blind_demo(args.db))
+
+
 def _cmd_validate(args: argparse.Namespace, svc: Any) -> None:
     from .validation import run_validation
 
     result = run_validation(args.db, args.out)
     _dump(result)
+
+
+# -- blind repeatability commands -----------------------------------------
+def _cmd_blind_transmit(args: argparse.Namespace, svc: RepeatabilityService) -> None:
+    _dump(
+        _json_rational(
+            svc.transmit(
+                determination_uid=args.uid,
+                blind_code=args.blind_code,
+                sample_id=args.sample_id,
+                method_id=args.method_id,
+                refresh=not args.no_refresh,
+            )
+        )
+    )
+
+
+def _cmd_blind_reveal_create(
+    args: argparse.Namespace, svc: RepeatabilityService
+) -> None:
+    payload = json.loads(Path(args.file).read_text())
+    if isinstance(payload, dict):
+        payload = payload.get("entries", payload)
+    if not isinstance(payload, list):
+        raise ValidationError("reveal file must contain a list of entries")
+    _dump(_json_rational(svc.create_reveal(args.name, payload)))
+
+
+def _cmd_blind_reveal_show(
+    args: argparse.Namespace, svc: RepeatabilityService
+) -> None:
+    _dump(_json_rational(svc.find_reveal(args.name, args.version)))
+
+
+def _cmd_blind_assess(
+    args: argparse.Namespace, svc: RepeatabilityService
+) -> None:
+    _dump(
+        _json_rational(
+            svc.assess(
+                reveal_id=args.reveal_id,
+                control_name=args.control,
+                method_id=args.method_id,
+            )
+        )
+    )
+
+
+def _cmd_blind_report_show(
+    args: argparse.Namespace, svc: RepeatabilityService
+) -> None:
+    _dump(_json_rational(svc.get_report(args.report_id)))
+
+
+def _cmd_blind_replay(
+    args: argparse.Namespace, svc: RepeatabilityService
+) -> None:
+    _dump(_json_rational(svc.replay_report(args.report_id)))
+
+
+def _cmd_blind_quote(
+    args: argparse.Namespace, svc: RepeatabilityService
+) -> None:
+    _dump(
+        _json_rational(
+            svc.quote(
+                report_id=args.report_id,
+                day_setup_cost=args.day_setup_cost,
+                per_determination_cost=args.per_determination_cost,
+                max_days=args.max_days,
+                max_per_day=args.max_per_day,
+                variance_cap=args.variance_cap,
+            )
+        )
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -302,8 +387,63 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--file", required=True)
     p.set_defaults(func=_cmd_import_product)
 
+    # -- blind repeatability / retest quotes ------------------------------
+    p = sub.add_parser(
+        "blind-transmit",
+        help="record a blind-coded transmission (retransmissions de-duplicate)",
+    )
+    p.add_argument("--uid", required=True, help="determination_uid")
+    p.add_argument("--blind-code", required=True)
+    p.add_argument("--sample-id", type=int, required=True)
+    p.add_argument("--method-id", type=int, required=True)
+    p.add_argument("--no-refresh", action="store_true")
+    p.set_defaults(func=_cmd_blind_transmit)
+
+    p = sub.add_parser(
+        "blind-reveal-create",
+        help="append a new key-release version from a JSON entries file",
+    )
+    p.add_argument("--name", required=True)
+    p.add_argument(
+        "--file",
+        required=True,
+        help='JSON list of {"blind_code","control_name","measurement_day"}',
+    )
+    p.set_defaults(func=_cmd_blind_reveal_create)
+
+    p = sub.add_parser("blind-reveal-show")
+    p.add_argument("--name", required=True)
+    p.add_argument("--version", type=int)
+    p.set_defaults(func=_cmd_blind_reveal_show)
+
+    p = sub.add_parser("blind-assess", help="assess one control + method")
+    p.add_argument("--reveal-id", type=int, required=True)
+    p.add_argument("--control", required=True)
+    p.add_argument("--method-id", type=int, required=True)
+    p.set_defaults(func=_cmd_blind_assess)
+
+    p = sub.add_parser("blind-report-show")
+    p.add_argument("--report-id", type=int, required=True)
+    p.set_defaults(func=_cmd_blind_report_show)
+
+    p = sub.add_parser("blind-replay", help="re-audit an old immutable report")
+    p.add_argument("--report-id", type=int, required=True)
+    p.set_defaults(func=_cmd_blind_replay)
+
+    p = sub.add_parser("blind-quote", help="minimum-cost retest quotation")
+    p.add_argument("--report-id", type=int, required=True)
+    p.add_argument("--day-setup-cost", required=True)
+    p.add_argument("--per-determination-cost", required=True)
+    p.add_argument("--max-days", type=int, required=True)
+    p.add_argument("--max-per-day", type=int, required=True)
+    p.add_argument("--variance-cap", required=True)
+    p.set_defaults(func=_cmd_blind_quote)
+
     p = sub.add_parser("demo")
     p.set_defaults(func=_cmd_demo)
+
+    p = sub.add_parser("blind-demo")
+    p.set_defaults(func=_cmd_blind_demo)
 
     p = sub.add_parser("validate")
     p.add_argument("--out", default="results/validation.json")
@@ -329,8 +469,10 @@ def main(argv: list[str] | None = None) -> int:
             "explain",
         }:
             svc = CurveService(store)
-        elif args.command in {"demo", "validate"}:
+        elif args.command in {"demo", "validate", "blind-demo"}:
             svc = None
+        elif args.command.startswith("blind-"):
+            svc = RepeatabilityService(store)
         else:
             svc = PotencyService(store)
         args.func(args, svc)

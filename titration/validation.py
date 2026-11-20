@@ -452,6 +452,88 @@ def run_validation(db_path: str, out_path: str) -> dict:
 
     check("potency_uses_only_public_products", no_candidate_table)
 
+    # -- blind repeatability and retest quotations ------------------------
+    def blind_headline() -> str:
+        from .repeatability import nested_anova, plan_retest, QuoteParams
+
+        stats = nested_anova(
+            [[Fraction(0), Fraction(2)], [Fraction(4), Fraction(6)]]
+        )
+        assert stats.within_day_variance == 2
+        assert stats.between_day_variance == 7
+        assert stats.ms_within == 2 and stats.ms_between == 16
+        quote5 = plan_retest(
+            Fraction(2), Fraction(7), QuoteParams.from_values(3, 1, 2, 2, 5)
+        )
+        assert quote5["selected"]["days"] == 2
+        assert quote5["selected"]["per_day"] == 1
+        assert quote5["selected"]["total_cost"] == "8"
+        quote8 = plan_retest(
+            Fraction(2), Fraction(7), QuoteParams.from_values(3, 1, 2, 2, 8)
+        )
+        assert quote8["selected"]["days"] == 1
+        assert quote8["selected"]["per_day"] == 2
+        assert quote8["selected"]["total_cost"] == "5"
+        return "headline (0,2)/(4,6): within 2 between 7; caps 5/8 -> (2,1)/8 and (1,2)/5"
+
+    check("blind_headline_anova_and_quotes", blind_headline)
+
+    def blind_negative_between() -> str:
+        from .repeatability import nested_anova
+
+        stats = nested_anova(
+            [[Fraction(0), Fraction(2)], [Fraction(1), Fraction(3)]]
+        )
+        assert stats.ms_within == 2 and stats.ms_between == 1
+        assert stats.between_day_variance_raw == Fraction(-1, 2)
+        assert stats.between_day_variance == 0
+        return "MS_within 2 > MS_between 1: raw estimate -1/2, clamped component 0"
+
+    check("blind_negative_between_clamped_with_raw_components", blind_negative_between)
+
+    def blind_infeasible_quote() -> str:
+        from .repeatability import plan_retest, QuoteParams
+
+        result = plan_retest(
+            Fraction(2), Fraction(7), QuoteParams.from_values(3, 1, 2, 2, 1)
+        )
+        assert result["status"] == "INFEASIBLE"
+        assert result["selected"] is None
+        assert result["best_achievable_variance"] == "4"
+        return "cap 1 unreachable within 2 days x 2; best achievable variance 4"
+
+    check("blind_infeasible_quote_reports_best_variance", blind_infeasible_quote)
+
+    def blind_end_to_end() -> str:
+        from .blind_demo import build_blind_scenario
+
+        blind_path = Path(db_path).with_name("validation_blind.sqlite")
+        if blind_path.exists():
+            blind_path.unlink()
+        result = build_blind_scenario(str(blind_path))
+        assert result["std_v1"]["within_day_variance"] == "2"
+        assert result["std_v1"]["between_day_variance"] == "7"
+        assert result["flat_v1"]["between_day_variance"] == "0"
+        assert result["flat_v1"]["anova"]["between_day_variance_raw"] == "-1/2"
+        # Retransmission counted once; same-value distinct uid counted twice.
+        assert result["transmissions"][0]["retransmission"] is True
+        assert (
+            result["same_value_distinct_determinations"]["independent_count"]
+            == 2
+        )
+        # Corrected review changes the components and the quote.
+        assert result["std_v2"]["between_day_variance"] == "1"
+        selected = result["quotes_v2"]["cap_5"]["selected"]
+        assert selected["days"] == 1 and selected["per_day"] == 1
+        # Old reveal product remains reproducible.
+        assert result["old_reveal_reaudit"]["still_reproduced"] is True
+        assert result["short_v1"]["status"] == "INCOMPLETE"
+        gap_codes = {g["code"] for g in result["short_v1"]["gaps"]}
+        assert "INSUFFICIENT_DAYS" in gap_codes
+        return "blind demo: dedup, clamp, corrected reveal, immutable re-audit, gaps"
+
+    check("blind_end_to_end_repeatability_scenario", blind_end_to_end)
+
     store.close()
 
     passed = sum(1 for c in checks if c["passed"])

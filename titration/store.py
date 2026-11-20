@@ -140,6 +140,78 @@ CREATE TABLE IF NOT EXISTS potency_reports (
     details_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- Blind-coded repeatability training data.  A determination is one
+-- independent measurement; repeat transmissions of the same determination_uid
+-- append to blind_transmissions but never create a second determination.
+CREATE TABLE IF NOT EXISTS blind_transmissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    blind_code TEXT NOT NULL,
+    determination_uid TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    received_at TEXT NOT NULL,
+    retransmission INTEGER NOT NULL,
+    UNIQUE (determination_uid, seq)
+);
+
+CREATE TABLE IF NOT EXISTS blind_determinations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    determination_uid TEXT NOT NULL UNIQUE,
+    blind_code TEXT NOT NULL,
+    method_id INTEGER NOT NULL,
+    sample_id INTEGER NOT NULL,
+    blank_product_id INTEGER NOT NULL,
+    sample_product_id INTEGER NOT NULL,
+    potency TEXT NOT NULL,
+    eval_status TEXT NOT NULL,
+    failures_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- Append-only key releases.  Re-keying a blind code produces a new reveal;
+-- old releases stay queryable for historical re-audit.
+CREATE TABLE IF NOT EXISTS blind_reveals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (name, version)
+);
+
+CREATE TABLE IF NOT EXISTS blind_reveal_entries (
+    reveal_id INTEGER NOT NULL,
+    blind_code TEXT NOT NULL,
+    control_name TEXT NOT NULL,
+    measurement_day INTEGER NOT NULL,
+    PRIMARY KEY (reveal_id, blind_code),
+    FOREIGN KEY (reveal_id) REFERENCES blind_reveals(id)
+);
+
+-- Immutable repeatability assessment products, one per
+-- (reveal, control, method) triple.
+CREATE TABLE IF NOT EXISTS repeatability_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reveal_id INTEGER NOT NULL,
+    control_name TEXT NOT NULL,
+    method_id INTEGER NOT NULL,
+    method_version INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    within_day_variance TEXT,
+    between_day_variance TEXT,
+    details_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (reveal_id, control_name, method_id)
+);
+
+-- Immutable retest quotations derived from a repeatability report.
+CREATE TABLE IF NOT EXISTS retest_quotes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (report_id) REFERENCES repeatability_reports(id)
+);
 """
 
 
@@ -794,3 +866,312 @@ class Store:
                 (batch_id,),
             ).fetchall()
         return [self.get_report(r["id"]) for r in rows]
+
+    # -- blind transmissions and determinations ---------------------------
+    def latest_transmission_seq(self, determination_uid: str) -> int | None:
+        row = self.conn.execute(
+            "SELECT MAX(seq) AS m FROM blind_transmissions"
+            " WHERE determination_uid = ?",
+            (determination_uid,),
+        ).fetchone()
+        return None if row["m"] is None else row["m"]
+
+    def create_transmission(
+        self, *, blind_code: str, determination_uid: str, retransmission: bool
+    ) -> dict:
+        cur = self.conn.execute(
+            "INSERT INTO blind_transmissions(blind_code, determination_uid,"
+            " seq, received_at, retransmission) VALUES (?, ?, ?, ?, ?)",
+            (
+                blind_code,
+                determination_uid,
+                self._next_transmission_seq(determination_uid),
+                _now(),
+                1 if retransmission else 0,
+            ),
+        )
+        self.conn.commit()
+        return self.get_transmission(cur.lastrowid)
+
+    def _next_transmission_seq(self, determination_uid: str) -> int:
+        latest = self.latest_transmission_seq(determination_uid)
+        return 1 if latest is None else latest + 1
+
+    def get_transmission(self, transmission_id: int) -> dict:
+        row = self.conn.execute(
+            "SELECT * FROM blind_transmissions WHERE id = ?", (transmission_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"transmission {transmission_id} not found")
+        return {
+            "id": row["id"],
+            "blind_code": row["blind_code"],
+            "determination_uid": row["determination_uid"],
+            "seq": row["seq"],
+            "received_at": row["received_at"],
+            "retransmission": bool(row["retransmission"]),
+        }
+
+    def list_transmissions(self, determination_uid: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT id FROM blind_transmissions WHERE determination_uid = ?"
+            " ORDER BY seq",
+            (determination_uid,),
+        ).fetchall()
+        return [self.get_transmission(r["id"]) for r in rows]
+
+    def create_determination(self, payload: dict) -> dict:
+        cur = self.conn.execute(
+            "INSERT INTO blind_determinations(determination_uid, blind_code,"
+            " method_id, sample_id, blank_product_id, sample_product_id,"
+            " potency, eval_status, failures_json, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                payload["determination_uid"],
+                payload["blind_code"],
+                payload["method_id"],
+                payload["sample_id"],
+                payload["blank_product_id"],
+                payload["sample_product_id"],
+                _ftext(payload["potency"]),
+                payload["eval_status"],
+                json.dumps(payload["failures"]),
+                _now(),
+            ),
+        )
+        self.conn.commit()
+        return self.get_determination(cur.lastrowid)
+
+    def get_determination_by_uid(self, determination_uid: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT id FROM blind_determinations WHERE determination_uid = ?",
+            (determination_uid,),
+        ).fetchone()
+        return None if row is None else self.get_determination(row["id"])
+
+    def get_determination(self, determination_id: int) -> dict:
+        row = self.conn.execute(
+            "SELECT * FROM blind_determinations WHERE id = ?",
+            (determination_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"determination {determination_id} not found")
+        return {
+            "id": row["id"],
+            "determination_uid": row["determination_uid"],
+            "blind_code": row["blind_code"],
+            "method_id": row["method_id"],
+            "sample_id": row["sample_id"],
+            "blank_product_id": row["blank_product_id"],
+            "sample_product_id": row["sample_product_id"],
+            "potency": parse_fraction(row["potency"]),
+            "eval_status": row["eval_status"],
+            "failures": json.loads(row["failures_json"]),
+            "created_at": row["created_at"],
+        }
+
+    def list_determinations_for_method(self, method_id: int) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT id FROM blind_determinations WHERE method_id = ? ORDER BY id",
+            (method_id,),
+        ).fetchall()
+        return [self.get_determination(r["id"]) for r in rows]
+
+    # -- blind reveals -----------------------------------------------------
+    def create_reveal(self, name: str, entries: Sequence[dict]) -> dict:
+        if not name or not str(name).strip():
+            raise ValidationError("reveal name must be non-empty")
+        if not entries:
+            raise ValidationError("a reveal needs at least one entry")
+        codes = [e["blind_code"] for e in entries]
+        if len(set(codes)) != len(codes):
+            raise ValidationError("duplicate blind_code in reveal payload")
+        for e in entries:
+            day = e["measurement_day"]
+            if isinstance(day, bool) or not isinstance(day, int) or day < 0:
+                raise ValidationError(
+                    "measurement_day must be a non-negative integer day index"
+                )
+        version_row = self.conn.execute(
+            "SELECT COALESCE(MAX(version), 0) AS v FROM blind_reveals WHERE name = ?",
+            (name,),
+        ).fetchone()
+        version = version_row["v"] + 1
+        now = _now()
+        cur = self.conn.execute(
+            "INSERT INTO blind_reveals(name, version, created_at) VALUES (?, ?, ?)",
+            (name, version, now),
+        )
+        reveal_id = cur.lastrowid
+        for e in entries:
+            self.conn.execute(
+                "INSERT INTO blind_reveal_entries(reveal_id, blind_code,"
+                " control_name, measurement_day) VALUES (?, ?, ?, ?)",
+                (
+                    reveal_id,
+                    e["blind_code"],
+                    e["control_name"],
+                    e["measurement_day"],
+                ),
+            )
+        self.conn.commit()
+        return self.get_reveal(reveal_id)
+
+    def get_reveal(self, reveal_id: int) -> dict:
+        row = self.conn.execute(
+            "SELECT * FROM blind_reveals WHERE id = ?", (reveal_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"blind reveal {reveal_id} not found")
+        entries = [
+            {
+                "blind_code": r["blind_code"],
+                "control_name": r["control_name"],
+                "measurement_day": r["measurement_day"],
+            }
+            for r in self.conn.execute(
+                "SELECT * FROM blind_reveal_entries WHERE reveal_id = ?"
+                " ORDER BY measurement_day, blind_code",
+                (reveal_id,),
+            ).fetchall()
+        ]
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "version": row["version"],
+            "created_at": row["created_at"],
+            "entries": entries,
+        }
+
+    def find_reveal(self, name: str, version: int | None = None) -> dict | None:
+        if version is None:
+            row = self.conn.execute(
+                "SELECT id FROM blind_reveals WHERE name = ? ORDER BY version DESC"
+                " LIMIT 1",
+                (name,),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT id FROM blind_reveals WHERE name = ? AND version = ?",
+                (name, version),
+            ).fetchone()
+        return None if row is None else self.get_reveal(row["id"])
+
+    def list_reveals(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT id FROM blind_reveals ORDER BY name, version"
+        ).fetchall()
+        return [self.get_reveal(r["id"]) for r in rows]
+
+    # -- repeatability reports and quotes ---------------------------------
+    def create_repeatability_report(
+        self,
+        *,
+        reveal_id: int,
+        control_name: str,
+        method_id: int,
+        method_version: int,
+        status: str,
+        within_day_variance: Fraction | None,
+        between_day_variance: Fraction | None,
+        details: dict,
+    ) -> dict:
+        cur = self.conn.execute(
+            "INSERT INTO repeatability_reports(reveal_id, control_name,"
+            " method_id, method_version, status, within_day_variance,"
+            " between_day_variance, details_json, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                reveal_id,
+                control_name,
+                method_id,
+                method_version,
+                status,
+                None if within_day_variance is None else _ftext(within_day_variance),
+                None if between_day_variance is None else _ftext(between_day_variance),
+                json.dumps(details),
+                _now(),
+            ),
+        )
+        self.conn.commit()
+        return self.get_repeatability_report(cur.lastrowid)
+
+    def find_repeatability_report(
+        self, reveal_id: int, control_name: str, method_id: int
+    ) -> dict | None:
+        row = self.conn.execute(
+            "SELECT id FROM repeatability_reports WHERE reveal_id = ? AND"
+            " control_name = ? AND method_id = ?",
+            (reveal_id, control_name, method_id),
+        ).fetchone()
+        return None if row is None else self.get_repeatability_report(row["id"])
+
+    def get_repeatability_report(self, report_id: int) -> dict:
+        row = self.conn.execute(
+            "SELECT * FROM repeatability_reports WHERE id = ?", (report_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"repeatability report {report_id} not found")
+        return {
+            "id": row["id"],
+            "reveal_id": row["reveal_id"],
+            "control_name": row["control_name"],
+            "method_id": row["method_id"],
+            "method_version": row["method_version"],
+            "status": row["status"],
+            "within_day_variance": None
+            if row["within_day_variance"] is None
+            else parse_fraction(row["within_day_variance"]),
+            "between_day_variance": None
+            if row["between_day_variance"] is None
+            else parse_fraction(row["between_day_variance"]),
+            "details": json.loads(row["details_json"]),
+            "created_at": row["created_at"],
+        }
+
+    def list_repeatability_reports(self, reveal_id: int | None = None) -> list[dict]:
+        if reveal_id is None:
+            rows = self.conn.execute(
+                "SELECT id FROM repeatability_reports ORDER BY id"
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT id FROM repeatability_reports WHERE reveal_id = ? ORDER BY id",
+                (reveal_id,),
+            ).fetchall()
+        return [self.get_repeatability_report(r["id"]) for r in rows]
+
+    def create_quote(self, *, report_id: int, status: str, details: dict) -> dict:
+        cur = self.conn.execute(
+            "INSERT INTO retest_quotes(report_id, status, details_json, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            (report_id, status, json.dumps(details), _now()),
+        )
+        self.conn.commit()
+        return self.get_quote(cur.lastrowid)
+
+    def get_quote(self, quote_id: int) -> dict:
+        row = self.conn.execute(
+            "SELECT * FROM retest_quotes WHERE id = ?", (quote_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"retest quote {quote_id} not found")
+        return {
+            "id": row["id"],
+            "report_id": row["report_id"],
+            "status": row["status"],
+            "details": json.loads(row["details_json"]),
+            "created_at": row["created_at"],
+        }
+
+    def list_quotes(self, report_id: int | None = None) -> list[dict]:
+        if report_id is None:
+            rows = self.conn.execute(
+                "SELECT id FROM retest_quotes ORDER BY id"
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT id FROM retest_quotes WHERE report_id = ? ORDER BY id",
+                (report_id,),
+            ).fetchall()
+        return [self.get_quote(r["id"]) for r in rows]
